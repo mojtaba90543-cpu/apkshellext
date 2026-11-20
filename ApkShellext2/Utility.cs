@@ -363,15 +363,22 @@ namespace ApkShellext2 {
         }
 
         public static void Log(object caller, string title, string message) {
-#if DEBUG
-            string output;
-            output = "[" + System.DateTime.Now.ToString() + "]";
+            string output = "[" + System.DateTime.Now.ToString() + "]";
             if (caller != null)
                 output += "<" + caller.GetType().Name + ">";
-            if (title != "")
+            if (!string.IsNullOrEmpty(title))
                 output += "|" + title + "|";
-            SharpShell.Diagnostics.Logging.Log(output + message);
+            output += message;
+#if DEBUG
+            SharpShell.Diagnostics.Logging.Log(output);
 #endif
+            // always write a plain text log: %TEMP%\apkshellext2.log
+            try {
+                string logFile = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "apkshellext2.log");
+                System.IO.FileInfo fi = new System.IO.FileInfo(logFile);
+                if (fi.Exists && fi.Length > 2 * 1024 * 1024) fi.Delete();
+                System.IO.File.AppendAllText(logFile, output + "\r\n");
+            } catch { }
         }
     }
 }

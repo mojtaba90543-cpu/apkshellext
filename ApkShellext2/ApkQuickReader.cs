@@ -1233,7 +1233,9 @@ namespace ApkQuickReader {
             }
 
             // Try the best candidate first, then every other density / variant of the same resource.
-            foreach (string candidate in GetIconCandidates(path)) {
+            List<string> iconCandidates = GetIconCandidates(path);
+            Log("icon candidates: " + string.Join(" | ", iconCandidates.ToArray()));
+            foreach (string candidate in iconCandidates) {
                 try {
                     Bitmap b = getImage(candidate, size);
                     if (b != null) {
