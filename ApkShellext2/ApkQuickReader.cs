@@ -1146,8 +1146,12 @@ namespace ApkQuickReader {
             manifest = s.ReadBytes((int)en.Size);
 
             en = zip.GetEntry(Resources_arsc);
-            s = new BinaryReader(zip.GetInputStream(en));
-            resources = s.ReadBytes((int)en.Size);
+            if (en != null) {
+                s = new BinaryReader(zip.GetInputStream(en));
+                resources = s.ReadBytes((int)en.Size);
+            } else {
+                resources = new byte[0];
+            }
         }
 
         public override AppPackageReader.AppType Type {
@@ -1207,22 +1211,41 @@ namespace ApkQuickReader {
             if (getFlag("Density") == null) {
                 setFlag("Density", 1);
             }
-            string path = QuickSearchManifestXml(tag, attr);
-            if (path == "") {
+            lastResource = null;
+            string path = "";
+            try {
+                path = QuickSearchManifestXml(tag, attr);
+            } catch (Exception ex) {
+                Log("Cannot resolve <" + tag + ">.<" + attr + ">: " + ex.Message);
+            }
+            if (string.IsNullOrEmpty(path) && attr == AttrIcon) {
+                // some apps only declare android:roundIcon
+                lastResource = null;
+                try {
+                    path = QuickSearchManifestXml(tag, "roundIcon");
+                } catch (Exception ex) {
+                    Log("Cannot resolve roundIcon: " + ex.Message);
+                }
+            }
+            if (string.IsNullOrEmpty(path)) {
                 Log("Cannot find image for <" + tag + ">.<" + attr + ">");
                 throw new Exception("Cannot find image for <" + tag + ">.<" + attr + ">");
             }
 
-            try {
-                if (path != "") {
-                    return getImage(path, size);
+            // Try the best candidate first, then every other density / variant of the same resource.
+            foreach (string candidate in GetIconCandidates(path)) {
+                try {
+                    Bitmap b = getImage(candidate, size);
+                    if (b != null) {
+                        return b;
+                    }
+                    Log("No usable image in " + candidate + ", trying next candidate");
+                } catch (Exception ex) {
+                    Log("Image path : " + candidate);
+                    Log("Error happens during extracting image, " + ex.Message);
                 }
-                throw new Exception("Cannot found image " + tag + "@" + attr);
-            } catch (Exception ex) {
-                Log("Image path : " + path);
-                Log("Error happens during extracting image, " + ex.Message);
-                return null;
             }
+            return null;
         }
 
         /// <summary>
@@ -1232,143 +1255,531 @@ namespace ApkQuickReader {
         /// <param name="path">png or xml file within apk zip</param>
         /// <returns>Bitmap or </returns>
         public Bitmap getImage(string path, Size size) {
-            ZipEntry iconz;
-            if (zip.FindEntry(path, true) > 0) {
-                iconz = zip.GetEntry(path);
+            if (string.IsNullOrEmpty(path) || zip.FindEntry(path, true) < 0) {
+                return null;
+            }
+            ZipEntry iconz = zip.GetEntry(path);
+            string lower = path.ToLowerInvariant();
 
-                if (path.EndsWith(".png")) {
-                    return (Bitmap)Image.FromStream(zip.GetInputStream(iconz));
-                } else if (path.EndsWith(".xml")) {
-                    XmlDocument doc = ExtractCompressedXml(path);
-                    if (doc.FirstChild.Name == "adaptive-icon") {
-                        return parseAdaptiveIcon(doc,size);
-                    } 
-                    else if (doc.FirstChild.Name == "vector") { // this is a vectordrawable
-                        XmlElement vector = (XmlElement)doc.DocumentElement.SelectSingleNode("/vector");
-                        int viewportWidth = 0, viewportHeight = 0;
-                        //int width = 0, height = 0;
-                        if (vector.HasAttribute("viewportWidth")) {
-                            viewportWidth = int.Parse(vector.GetAttribute("viewportWidth"));
-                        }
-                        if (vector.HasAttribute("viewportHeight")) {
-                            viewportHeight = int.Parse(vector.GetAttribute("viewportHeight"));
-                            if (viewportWidth == 0) viewportWidth = viewportHeight;
+            if (lower.EndsWith(".png") || lower.EndsWith(".jpg") || lower.EndsWith(".jpeg") ||
+                lower.EndsWith(".gif") || lower.EndsWith(".bmp")) {
+                return LoadRaster(iconz);
+            }
+            if (lower.EndsWith(".webp")) {
+                return LoadWebP(iconz);
+            }
+            if (!lower.EndsWith(".xml")) {
+                return null;
+            }
+
+            XmlDocument doc = ExtractCompressedXml(path);
+            XmlElement root = doc.DocumentElement;
+            if (root == null) {
+                return null;
+            }
+
+            if (root.Name == "adaptive-icon") {
+                return parseAdaptiveIcon(doc, size);
+            } else if (root.Name == "vector") { // this is a vectordrawable
+                return renderVector(root, size);
+            } else if (root.Name == "layer-list") {
+                List<Bitmap> layers = new List<Bitmap>();
+                foreach (XmlElement item in root.SelectNodes("item")) {
+                    Bitmap layer = null;
+                    if (item.HasAttribute("drawable")) {
+                        string d = item.GetAttribute("drawable");
+                        Color lc;
+                        if (TryStringToColor(d, out lc)) {
+                            layer = SolidBitmap(lc, size);
                         } else {
-                            viewportHeight = viewportWidth;
+                            layer = getImage(d, size);
                         }
-                        Bitmap b = new Bitmap(viewportWidth, viewportHeight);
-                        using (Graphics g = Graphics.FromImage(b)) {
-                            XmlElement group = (XmlElement)vector.SelectSingleNode("group");
-                            XmlNodeList nl = (group != null)? group.SelectNodes("path"):
-                                                              vector.SelectNodes("path");
-                            foreach (XmlElement elem in nl) {
-                                string pathdata = elem.GetAttribute("pathData");
-                                GraphicsPath gpath = VectorDrawableRender.Convert2Path(pathdata);
-                                Brush fill = null;
-                                if (elem.HasAttribute("fillColor")) {
-                                    string fillcolor = elem.GetAttribute("fillColor");
-                                    if (fillcolor.EndsWith(".xml")) {//gradien
-                                        fill = parseGradient(fillcolor);
-                                    } else {
-                                        fill = new SolidBrush(stringToColor(elem.GetAttribute("fillColor")));
-                                        //fill = (Brush)(new Media.BrushConverter().ConvertFromString(elem.GetAttribute("fillColor")));
-                                    }
-                                } else {
-                                    fill = new SolidBrush(System.Drawing.Color.Black);
-                                }
-                                g.FillPath(fill, gpath);
-                                //g.DrawPath(new Pen(fill, 2), path);                    
-                            }
+                    } else {
+                        XmlElement shape = (XmlElement)item.SelectSingleNode("shape");
+                        if (shape != null) {
+                            layer = parseShape(shape);
+                        } else {
+                            throw new Exception("unrecorgnized element in layer-list: " + path);
                         }
-                        return b;
                     }
-                    else if (doc.FirstChild.Name == "layer-list") {
-                        XmlNodeList nl = doc.DocumentElement.SelectNodes("/layer-list/item");
-                        List<Bitmap> bitmapList = new List<Bitmap>(nl.Count);
-                        foreach (XmlElement e in nl) {
-                            if (e.HasAttribute("drawable")) {
-                                Bitmap b = getImage(e.GetAttribute("drawable"),size);
-                                bitmapList.Add(b);
-                            } else {
-                                XmlElement shape = (XmlElement)e.SelectSingleNode("shape");
-                                if (shape != null) {
-                                    bitmapList.Add(parseShape(shape));
-                                } else {
-                                    throw new Exception("unrecorgnized element in layer-list: " + path);
-                                }
-                            }
-                        }
-                        Bitmap bmp = new Bitmap(size.Width, size.Height);
-                        Graphics g = Graphics.FromImage(bmp);
-                        foreach (Bitmap b in bitmapList) {
-                            g.DrawImage(Utility.ResizeBitmap(b, new Size(bmp.Width,bmp.Height)),0,0);
-                        }
-                        return bmp;
-                    }
-                    else {
-                        throw new Exception("unsupported image file");
+                    if (layer != null) {
+                        layers.Add(layer);
                     }
                 }
+                if (layers.Count == 0) {
+                    return null;
+                }
+                Bitmap bmp = new Bitmap(Math.Max(size.Width, 1), Math.Max(size.Height, 1));
+                using (Graphics g = Graphics.FromImage(bmp)) {
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    foreach (Bitmap l in layers) {
+                        DrawScaled(g, l, bmp.Width, bmp.Height);
+                    }
+                }
+                return bmp;
+            }
+            throw new Exception("unsupported image file: " + root.Name);
+        }
+
+        // The resource that was resolved by the most recent manifest lookup
+        // (all densities / variants), used to fall back to another candidate.
+        private ApkResource lastResource = null;
+
+        private static int GetDensity(byte[] conf) {
+            int o = (int)ResourceConfig.Density;
+            if (conf == null || conf.Length < o + 2) {
+                return 0;
+            }
+            return conf[o + 1] * 256 + conf[o];
+        }
+
+        private List<string> GetIconCandidates(string chosen) {
+            List<string> list = new List<string>();
+            list.Add(chosen);
+            ApkResource r = lastResource;
+            if (r != null) {
+                List<KeyValuePair<long, string>> others = new List<KeyValuePair<long, string>>();
+                for (int i = 0; i < r.values.Count; i++) {
+                    string v = r.values[i] as string;
+                    if (v == null || v.IndexOf('/') < 0 || list.Contains(v)) {
+                        continue;
+                    }
+                    bool isXml = v.EndsWith(".xml", StringComparison.OrdinalIgnoreCase);
+                    long score = isXml ? -1 : GetDensity(r.configs[i]);
+                    others.Add(new KeyValuePair<long, string>(score, v));
+                }
+                others.Sort((a, b) => b.Key.CompareTo(a.Key));
+                foreach (KeyValuePair<long, string> kv in others) {
+                    if (!list.Contains(kv.Value)) {
+                        list.Add(kv.Value);
+                    }
+                }
+            }
+            return list;
+        }
+
+        private static byte[] ReadAll(Stream s) {
+            using (MemoryStream ms = new MemoryStream()) {
+                byte[] buf = new byte[16384];
+                int n;
+                while ((n = s.Read(buf, 0, buf.Length)) > 0) {
+                    ms.Write(buf, 0, n);
+                }
+                return ms.ToArray();
+            }
+        }
+
+        private Bitmap LoadRaster(ZipEntry e) {
+            byte[] data;
+            using (Stream s = zip.GetInputStream(e)) {
+                data = ReadAll(s);
+            }
+            using (MemoryStream ms = new MemoryStream(data))
+            using (Image img = Image.FromStream(ms)) {
+                return new Bitmap(img); // detach from the stream, keep alpha
+            }
+        }
+
+        /// <summary>
+        /// GDI+ cannot decode WebP, so use the WPF/WIC decoder. This needs the
+        /// Windows WebP codec (built into Windows 11, "WebP Image Extensions" on Windows 10).
+        /// </summary>
+        private Bitmap LoadWebP(ZipEntry e) {
+            byte[] data;
+            using (Stream s = zip.GetInputStream(e)) {
+                data = ReadAll(s);
+            }
+            try {
+                using (MemoryStream ms = new MemoryStream(data)) {
+                    System.Windows.Media.Imaging.BitmapDecoder decoder =
+                        System.Windows.Media.Imaging.BitmapDecoder.Create(ms,
+                            System.Windows.Media.Imaging.BitmapCreateOptions.PreservePixelFormat,
+                            System.Windows.Media.Imaging.BitmapCacheOption.OnLoad);
+                    System.Windows.Media.Imaging.PngBitmapEncoder encoder =
+                        new System.Windows.Media.Imaging.PngBitmapEncoder();
+                    encoder.Frames.Add(decoder.Frames[0]);
+                    using (MemoryStream png = new MemoryStream()) {
+                        encoder.Save(png);
+                        png.Position = 0;
+                        using (Image img = Image.FromStream(png)) {
+                            return new Bitmap(img);
+                        }
+                    }
+                }
+            } catch (Exception ex) {
+                Log("Cannot decode WebP icon " + e.Name + " (Windows WebP codec missing?): " + ex.Message);
+                return null;
+            }
+        }
+
+        private static Bitmap SolidBitmap(Color c, Size size) {
+            Bitmap b = new Bitmap(Math.Max(size.Width, 1), Math.Max(size.Height, 1));
+            using (Graphics g = Graphics.FromImage(b)) {
+                g.Clear(c);
+            }
+            return b;
+        }
+
+        // draw with edge clamping, avoids a transparent/dark border when scaling
+        private static void DrawScaled(Graphics g, Bitmap src, int w, int h) {
+            using (System.Drawing.Imaging.ImageAttributes ia = new System.Drawing.Imaging.ImageAttributes()) {
+                ia.SetWrapMode(WrapMode.TileFlipXY);
+                g.DrawImage(src, new Rectangle(0, 0, w, h), 0, 0, src.Width, src.Height, GraphicsUnit.Pixel, ia);
+            }
+        }
+
+        private static GraphicsPath RoundedRect(float w, float h, float r) {
+            GraphicsPath p = new GraphicsPath();
+            float d = r * 2f;
+            p.AddArc(0, 0, d, d, 180, 90);
+            p.AddArc(w - d, 0, d, d, 270, 90);
+            p.AddArc(w - d, h - d, d, d, 0, 90);
+            p.AddArc(0, h - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        private static float ParseFloat(string s, float def) {
+            if (string.IsNullOrEmpty(s)) {
+                return def;
+            }
+            Match m = Regex.Match(s, @"^\s*(-?\d+(\.\d+)?([eE][-+]?\d+)?)");
+            float f;
+            if (m.Success && float.TryParse(m.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out f)) {
+                return f;
+            }
+            return def;
+        }
+
+        private static Color WithAlpha(Color c, float a) {
+            if (a >= 1f) return c;
+            if (a < 0f) a = 0f;
+            return Color.FromArgb((int)Math.Round(c.A * a), c);
+        }
+
+        /// <summary>
+        /// Accepts #RGB, #ARGB, #RRGGBB, #AARRGGBB or a decimal ARGB number
+        /// (the way resolved color resources are returned). #RRGGBB is opaque.
+        /// </summary>
+        private static bool TryStringToColor(string s, out Color color) {
+            color = Color.Transparent;
+            if (string.IsNullOrEmpty(s)) {
+                return false;
+            }
+            s = s.Trim();
+            uint v;
+            if (s.StartsWith("#")) {
+                string hex = s.Substring(1);
+                if (hex.Length == 3) {
+                    hex = "FF" + new string(new char[] { hex[0], hex[0], hex[1], hex[1], hex[2], hex[2] });
+                } else if (hex.Length == 4) {
+                    hex = new string(new char[] { hex[0], hex[0], hex[1], hex[1], hex[2], hex[2], hex[3], hex[3] });
+                } else if (hex.Length == 6) {
+                    hex = "FF" + hex;
+                }
+                if (!uint.TryParse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out v)) {
+                    return false;
+                }
+            } else if (!uint.TryParse(s, NumberStyles.None, CultureInfo.InvariantCulture, out v)) {
+                return false;
+            }
+            color = Color.FromArgb(unchecked((int)v));
+            return true;
+        }
+
+        private Bitmap LoadAdaptiveLayer(XmlElement layer, Size size, out Color fill, out bool hasFill) {
+            fill = Color.Transparent;
+            hasFill = false;
+            if (layer == null) {
+                return null;
+            }
+            string d = layer.GetAttribute("drawable");
+            if (string.IsNullOrEmpty(d)) {
+                return null;
+            }
+            if (TryStringToColor(d, out fill)) { // layer is just a color
+                hasFill = true;
+                return null;
+            }
+            try {
+                return getImage(d, size);
+            } catch (Exception ex) {
+                Log("Cannot load adaptive icon layer " + d + " : " + ex.Message);
+                return null;
+            }
+        }
+
+        private Bitmap parseAdaptiveIcon(XmlNode node, Size size) {
+            /*
+            <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+            </adaptive-icon>
+            Both layers are 108dp; the launcher only shows the centre 72dp through a mask.
+            */
+            Bitmap back = null, fore = null, full = null;
+            try {
+                XmlElement belem = node.SelectSingleNode("/adaptive-icon/background") as XmlElement;
+                XmlElement felem = node.SelectSingleNode("/adaptive-icon/foreground") as XmlElement;
+
+                int layerPx = Math.Max(Math.Max(size.Width, size.Height), 432);
+                Size layerSize = new Size(layerPx, layerPx);
+                Color backFill, foreFill;
+                bool backHas, foreHas;
+                back = LoadAdaptiveLayer(belem, layerSize, out backFill, out backHas);
+                fore = LoadAdaptiveLayer(felem, layerSize, out foreFill, out foreHas);
+                if (back == null && fore == null && !backHas && !foreHas) {
+                    throw new Exception("adaptive icon has no usable layer");
+                }
+
+                int canvas = Math.Max(size.Width, size.Height);
+                if (back != null) canvas = Math.Max(canvas, back.Width);
+                if (fore != null) canvas = Math.Max(canvas, fore.Width);
+                canvas = Math.Min(Math.Max(canvas, 108), 1024);
+
+                full = new Bitmap(canvas, canvas);
+                using (Graphics g = Graphics.FromImage(full)) {
+                    g.SmoothingMode = SmoothingMode.HighQuality;
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    if (backHas) {
+                        g.Clear(backFill);
+                    } else if (back != null) {
+                        DrawScaled(g, back, canvas, canvas);
+                    }
+                    if (foreHas) {
+                        using (Brush br = new SolidBrush(foreFill)) {
+                            g.FillRectangle(br, 0, 0, canvas, canvas);
+                        }
+                    } else if (fore != null) {
+                        DrawScaled(g, fore, canvas, canvas);
+                    }
+                }
+
+                // keep the visible 72/108 area and round the corners like a launcher does
+                int inset = canvas / 6;
+                int outSize = canvas - 2 * inset;
+                Bitmap result = new Bitmap(outSize, outSize);
+                using (Graphics g = Graphics.FromImage(result))
+                using (GraphicsPath mask = RoundedRect(outSize, outSize, outSize * 0.22f)) {
+                    g.SmoothingMode = SmoothingMode.HighQuality;
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    g.SetClip(mask);
+                    g.DrawImage(full, new Rectangle(0, 0, outSize, outSize), inset, inset, outSize, outSize, GraphicsUnit.Pixel);
+                }
+                return result;
+            } catch (Exception ex) {
+                throw new Exception(ex.Message + "\nError happening during parse AdaptiveIcon xml");
+            } finally {
+                if (back != null) back.Dispose();
+                if (fore != null) fore.Dispose();
+                if (full != null) full.Dispose();
+            }
+        }
+
+        // ------------------------------------------------------------ VectorDrawable renderer
+        private Bitmap renderVector(XmlElement vector, Size size) {
+            float vw = ParseFloat(vector.GetAttribute("viewportWidth"), 0);
+            float vh = ParseFloat(vector.GetAttribute("viewportHeight"), 0);
+            if (vw <= 0) vw = ParseFloat(vector.GetAttribute("width"), 0);
+            if (vh <= 0) vh = ParseFloat(vector.GetAttribute("height"), 0);
+            if (vw <= 0) vw = vh;
+            if (vh <= 0) vh = vw;
+            if (vw <= 0) { vw = 24; vh = 24; }
+
+            int px = Math.Min(Math.Max(Math.Max(size.Width, size.Height), 16), 1024);
+            float scale = Math.Min(px / vw, px / vh);
+            Bitmap bmp = new Bitmap(px, px);
+            try {
+                using (Graphics g = Graphics.FromImage(bmp)) {
+                    g.SmoothingMode = SmoothingMode.HighQuality;
+                    g.TranslateTransform((px - vw * scale) / 2f, (px - vh * scale) / 2f);
+                    g.ScaleTransform(scale, scale);
+                    drawVectorChildren(g, vector);
+                }
+                return bmp;
+            } catch {
+                bmp.Dispose();
+                throw;
+            }
+        }
+
+        private void drawVectorChildren(Graphics g, XmlElement parent) {
+            foreach (XmlNode node in parent.ChildNodes) {
+                XmlElement e = node as XmlElement;
+                if (e == null) continue;
+                if (e.Name == "group") {
+                    GraphicsState state = g.Save();
+                    try {
+                        float pivotX = ParseFloat(e.GetAttribute("pivotX"), 0);
+                        float pivotY = ParseFloat(e.GetAttribute("pivotY"), 0);
+                        float translateX = ParseFloat(e.GetAttribute("translateX"), 0);
+                        float translateY = ParseFloat(e.GetAttribute("translateY"), 0);
+                        float scaleX = ParseFloat(e.GetAttribute("scaleX"), 1);
+                        float scaleY = ParseFloat(e.GetAttribute("scaleY"), 1);
+                        float rotation = ParseFloat(e.GetAttribute("rotation"), 0);
+                        // Android: M = T(translate) * T(pivot) * R * S * T(-pivot)
+                        g.TranslateTransform(translateX + pivotX, translateY + pivotY);
+                        if (rotation != 0f) g.RotateTransform(rotation);
+                        g.ScaleTransform(scaleX, scaleY);
+                        g.TranslateTransform(-pivotX, -pivotY);
+                        drawVectorChildren(g, e);
+                    } finally {
+                        g.Restore(state);
+                    }
+                } else if (e.Name == "clip-path") {
+                    try {
+                        string cd = e.GetAttribute("pathData");
+                        if (!string.IsNullOrEmpty(cd)) {
+                            using (GraphicsPath cp = VectorDrawableRender.Convert2Path(cd)) {
+                                g.SetClip(cp, CombineMode.Intersect);
+                            }
+                        }
+                    } catch (Exception ex) {
+                        Log("clip-path error: " + ex.Message);
+                    }
+                } else if (e.Name == "path") {
+                    try {
+                        drawVectorPath(g, e);
+                    } catch (Exception ex) {
+                        Log("vector path error: " + ex.Message);
+                    }
+                }
+            }
+        }
+
+        private void drawVectorPath(Graphics g, XmlElement e) {
+            string pathdata = e.GetAttribute("pathData");
+            if (string.IsNullOrEmpty(pathdata)) return;
+            using (GraphicsPath gp = VectorDrawableRender.Convert2Path(pathdata)) {
+                string ft = e.GetAttribute("fillType");
+                gp.FillMode = (ft == "1" || ft == "evenOdd") ? FillMode.Alternate : FillMode.Winding;
+
+                // NOTE: Android draws NOTHING when fillColor is absent. The old code painted such
+                // paths black, which is where the black icons came from.
+                using (Brush fill = MakeVectorBrush(e, "fillColor", ParseFloat(e.GetAttribute("fillAlpha"), 1))) {
+                    if (fill != null) {
+                        g.FillPath(fill, gp);
+                    }
+                }
+
+                float sw = ParseFloat(e.GetAttribute("strokeWidth"), 0);
+                if (sw > 0) {
+                    using (Brush sb = MakeVectorBrush(e, "strokeColor", ParseFloat(e.GetAttribute("strokeAlpha"), 1))) {
+                        if (sb != null) {
+                            using (Pen pen = new Pen(sb, sw)) {
+                                string cap = e.GetAttribute("strokeLineCap");
+                                LineCap lc = cap == "1" ? LineCap.Round : (cap == "2" ? LineCap.Square : LineCap.Flat);
+                                pen.StartCap = lc;
+                                pen.EndCap = lc;
+                                string join = e.GetAttribute("strokeLineJoin");
+                                pen.LineJoin = join == "1" ? LineJoin.Round : (join == "2" ? LineJoin.Bevel : LineJoin.Miter);
+                                pen.MiterLimit = Math.Max(1f, ParseFloat(e.GetAttribute("strokeMiterLimit"), 4));
+                                g.DrawPath(pen, gp);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Brush for fillColor/strokeColor: plain color, color resource, gradient xml,
+        /// color selector, or an inline aapt:attr gradient. Returns null when there is nothing to draw.
+        /// </summary>
+        private Brush MakeVectorBrush(XmlElement e, string attr, float alpha) {
+            try {
+                string v = e.GetAttribute(attr);
+                if (!string.IsNullOrEmpty(v)) {
+                    if (v.EndsWith(".xml", StringComparison.OrdinalIgnoreCase)) {
+                        XmlDocument d = ExtractCompressedXml(v);
+                        XmlElement root = d.DocumentElement;
+                        if (root != null && root.Name == "gradient") {
+                            return BuildGradientBrush(root, alpha);
+                        }
+                        if (root != null && root.Name == "selector") {
+                            string colorValue = null;
+                            foreach (XmlNode n in root.ChildNodes) {
+                                XmlElement it = n as XmlElement;
+                                if (it != null && it.HasAttribute("color")) {
+                                    colorValue = it.GetAttribute("color"); // the last item is the default state
+                                }
+                            }
+                            Color sc;
+                            if (colorValue != null && TryStringToColor(colorValue, out sc)) {
+                                return new SolidBrush(WithAlpha(sc, alpha));
+                            }
+                        }
+                        return null;
+                    }
+                    Color c;
+                    if (TryStringToColor(v, out c)) {
+                        return new SolidBrush(WithAlpha(c, alpha));
+                    }
+                    return null;
+                }
+                foreach (XmlNode n2 in e.ChildNodes) {
+                    XmlElement child = n2 as XmlElement;
+                    if (child == null || child.Name != "attr") continue;
+                    string nm = child.GetAttribute("name");
+                    if (string.IsNullOrEmpty(nm) || !nm.EndsWith(attr)) continue;
+                    XmlElement grad = child.FirstChild as XmlElement;
+                    if (grad != null && grad.Name == "gradient") {
+                        return BuildGradientBrush(grad, alpha);
+                    }
+                }
+            } catch (Exception ex) {
+                Log("Cannot create brush for " + attr + ": " + ex.Message);
             }
             return null;
         }
 
-        private Bitmap parseAdaptiveIcon(XmlNode node, Size size) {
-            /// Get adaptive - icon
-            /// 
-            /*
-            <?xml version="1.0" encoding="utf-8"?>
-            <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-            <background android:drawable="@drawable/ic_launcher_background" />
-            <foreground android:drawable="@drawable/ic_launcher_foreground" />
-            </adaptive-icon>
-            */
-            try {
-                XmlElement belem = (XmlElement)node.SelectSingleNode("/adaptive-icon/background");
-                Bitmap b = null, f = null;
-                int width = 0, height = 0;
-                if (belem.HasAttribute("drawable")) {
-                    b = getImage(belem.GetAttribute("drawable"),size);
-                    if (b != null) {
-                        width = b.Width;
-                        height = b.Height;
-                    }
-                }
-                XmlElement felem = (XmlElement)node.SelectSingleNode("/adaptive-icon/foreground");
-                if (felem.HasAttribute("drawable")) {
-                    f = getImage(felem.GetAttribute("drawable"),size);
-                    if (f != null) {
-                        width = width > f.Width ? width : f.Width;
-                        height = height > f.Height ? height : f.Height;
-                    }
-                }
-
-                Bitmap bmp = new Bitmap(width, height);
-                Graphics g = Graphics.FromImage(bmp);
-                if (b != null)
-                    g.DrawImage(b, 0, 0);
-                else
-                    try {
-                        Color c = stringToColor(belem.GetAttribute("drawable"));
-                        g.FillRectangle(new SolidBrush(c), 0, 0, bmp.Width, bmp.Height);
-                    } catch  {
-                        //throw new Exception("Cannot parse out background, innerxml = "+ belem.InnerXml);
-                    }
-                if (f != null)
-                    g.DrawImage(f, 0, 0);
-                else
-                    try {
-                        Color c = stringToColor(belem.GetAttribute("drawable"));
-                        g.FillRectangle(new SolidBrush(c), 0, 0, bmp.Width, bmp.Height);
-                    } catch  {
-                        //throw new Exception("Cannot parse out background, innerxml = "+ belem.InnerXml);
-                    }
-                //b.Save("b.bmp");
-                //f.Save("f.bmp");
-                return bmp;
-            } catch (Exception ex) {
-                throw new Exception(ex.Message + "\nError happening during parse AdaptiveIcon xml");
+        private Brush BuildGradientBrush(XmlElement gradient, float alpha) {
+            List<Color> colors = new List<Color>();
+            List<float> offsets = new List<float>();
+            foreach (XmlNode n in gradient.ChildNodes) {
+                XmlElement it = n as XmlElement;
+                Color c;
+                if (it == null || it.Name != "item" || !TryStringToColor(it.GetAttribute("color"), out c)) continue;
+                colors.Add(WithAlpha(c, alpha));
+                offsets.Add(ParseFloat(it.GetAttribute("offset"), 0));
             }
+            if (colors.Count == 0) {
+                Color c1;
+                if (TryStringToColor(gradient.GetAttribute("startColor"), out c1)) { colors.Add(WithAlpha(c1, alpha)); offsets.Add(0f); }
+                if (TryStringToColor(gradient.GetAttribute("centerColor"), out c1)) { colors.Add(WithAlpha(c1, alpha)); offsets.Add(0.5f); }
+                if (TryStringToColor(gradient.GetAttribute("endColor"), out c1)) { colors.Add(WithAlpha(c1, alpha)); offsets.Add(1f); }
+            }
+            if (colors.Count == 0) return null;
+            if (colors.Count == 1) return new SolidBrush(colors[0]);
+
+            string type = gradient.GetAttribute("type"); // 0 linear (default), 1 radial, 2 sweep
+            if (type == "1" || type == "2") {
+                return new SolidBrush(colors[colors.Count - 1]); // approximation
+            }
+
+            float startX = ParseFloat(gradient.GetAttribute("startX"), 0);
+            float startY = ParseFloat(gradient.GetAttribute("startY"), 0);
+            float endX = ParseFloat(gradient.GetAttribute("endX"), 0);
+            float endY = ParseFloat(gradient.GetAttribute("endY"), 0);
+            if (startX == endX && startY == endY) return new SolidBrush(colors[0]);
+
+            for (int i = 0; i < offsets.Count; i++) {
+                float o = Math.Min(1f, Math.Max(0f, offsets[i]));
+                if (i > 0 && o < offsets[i - 1]) o = offsets[i - 1];
+                offsets[i] = o;
+            }
+            if (offsets[0] > 0f) { colors.Insert(0, colors[0]); offsets.Insert(0, 0f); }
+            if (offsets[offsets.Count - 1] < 1f) { colors.Add(colors[colors.Count - 1]); offsets.Add(1f); }
+
+            LinearGradientBrush lgb = new LinearGradientBrush(new PointF(startX, startY), new PointF(endX, endY),
+                                                              colors[0], colors[colors.Count - 1]);
+            ColorBlend blend = new ColorBlend(colors.Count);
+            blend.Colors = colors.ToArray();
+            blend.Positions = offsets.ToArray();
+            lgb.InterpolationColors = blend;
+            return lgb;
         }
 
         private Brush parseGradient(XmlNode node) {
@@ -1420,14 +1831,22 @@ namespace ApkQuickReader {
             try {
                 Bitmap b;
                 XmlElement eShape = (XmlElement)shapeNode;
-                shapeType type = (shapeType)int.Parse(eShape.GetAttribute("shape"));
+                int shapeVal;
+                if (!int.TryParse(eShape.GetAttribute("shape"), out shapeVal)) shapeVal = 0; // default = rectangle
+                shapeType type = (shapeType)shapeVal;
                 XmlElement eSize = (XmlElement)eShape.SelectSingleNode("size");
-                if (eSize != null)
-                    b = new Bitmap(int.Parse(eSize.GetAttribute("width")), int.Parse(eSize.GetAttribute("height")));
-                else {
-                    int s = Convert.ToInt32(getFlag("ImageSize"));
-                    b = new Bitmap(s, s);
+                int shapeW = 0, shapeH = 0;
+                if (eSize != null) {
+                    shapeW = (int)ParseFloat(eSize.GetAttribute("width"), 0);   // value looks like "108dp"
+                    shapeH = (int)ParseFloat(eSize.GetAttribute("height"), 0);
                 }
+                if (shapeW <= 0 || shapeH <= 0) {
+                    int s = Convert.ToInt32(getFlag("ImageSize"));
+                    if (s <= 0) s = 108; // "ImageSize" is only set by the context menu, never by the icon handler
+                    shapeW = s;
+                    shapeH = s;
+                }
+                b = new Bitmap(shapeW, shapeH);
                 Graphics g = Graphics.FromImage(b);
                 GraphicsPath p = new GraphicsPath();
                 Brush brush;
@@ -1462,12 +1881,11 @@ namespace ApkQuickReader {
         }
 
         private Color stringToColor(string color) {
-            color = color.Trim();
-            if (color.StartsWith("#")) {
-                return Color.FromArgb((int)uint.Parse(color.Substring(1), NumberStyles.HexNumber));
-            } else {
-                return Color.FromArgb((int)uint.Parse(color));
+            Color c;
+            if (!TryStringToColor(color, out c)) {
+                throw new FormatException("Cannot parse color: " + color);
             }
+            return c;
         }
 
         /// <summary>
@@ -1534,6 +1952,7 @@ namespace ApkQuickReader {
                                             return QuickSearchCompressedXmlStringPool(xml, data);
                                         } else if (dataType == DATA_TYPE.TYPE_REFERENCE) {
                                             ApkResource r = QuickSearchResource((UInt32)data);
+                                            lastResource = r;
                                             result.Add(r);
                                             if (r.Count > 1) {
                                                 int index = applyFilter(r);
@@ -1611,6 +2030,7 @@ namespace ApkQuickReader {
                                 string name = QuickSearchCompressedXmlStringPool(bytes, ind);
                                 if (name == "")
                                     name = QuickSearchCompressedXMLResMap(bytes, ind);
+                                if (string.IsNullOrEmpty(name)) continue;
 
                                 ms.Seek(4 + 2 + 1, SeekOrigin.Current); // skip rawValue/size/0/
                                 DATA_TYPE dataType = (DATA_TYPE)br.ReadByte();
@@ -1644,7 +2064,7 @@ namespace ApkQuickReader {
                                     currentElem.SetAttribute(name, (data >> 8).ToString() + unit);
                                 } else if (dataType == DATA_TYPE.TYPE_FLOAT) {
                                     float f = BitConverter.ToSingle(BitConverter.GetBytes(data), 0);
-                                    currentElem.SetAttribute(name, f.ToString());
+                                    currentElem.SetAttribute(name, f.ToString(CultureInfo.InvariantCulture));
                                 } else if (dataType == DATA_TYPE.TYPE_INT_COLOR_ARGB8 ||
                                     dataType == DATA_TYPE.TYPE_INT_COLOR_ARGB4 ||
                                     dataType == DATA_TYPE.TYPE_INT_COLOR_RGB4 ||
@@ -1697,9 +2117,10 @@ namespace ApkQuickReader {
         }
 
         private string QuickSearchCompressedXMLResMap(byte[] xml, uint stringID) {
-            using (MemoryStream ms = new MemoryStream(manifest))
+            using (MemoryStream ms = new MemoryStream(xml))
             using (BinaryReader br = new BinaryReader(ms)) {
                 ms.Seek(8, SeekOrigin.Begin); // skip header
+
 
                 //long stringPoolPos = ms.Position;
                 ms.Seek(4, SeekOrigin.Current);
@@ -1709,7 +2130,7 @@ namespace ApkQuickReader {
                 if (chunktype == RES_TYPE.RES_XML_RESOURCE_MAP_TYPE) {
                     //Resource map
                     ms.Seek(2 + 2 + 4 + stringID * 4, SeekOrigin.Current);
-                    return Enum.GetName(typeof(RDefaultString), br.ReadUInt32());
+                    return Enum.GetName(typeof(RDefaultString), br.ReadUInt32()) ?? "";
                 } else {
                     return "";
                 }
@@ -1868,7 +2289,8 @@ namespace ApkQuickReader {
                             if (chunkType == (short)RES_TYPE.RES_TABLE_TYPE_TYPE) {
                                 typeid = br.ReadByte();
                                 if (typeid == res.TypeID) {
-                                    ms.Seek(3, SeekOrigin.Current); // skip 0
+                                    byte typeFlags = br.ReadByte();
+                                    ms.Seek(2, SeekOrigin.Current); // reserved
                                     int entryCount = br.ReadInt32();
                                     int entryStart = br.ReadInt32();
 
@@ -1876,9 +2298,28 @@ namespace ApkQuickReader {
                                     int config_size = br.ReadInt32();
                                     byte[] conf = br.ReadBytes(config_size - 4);
 
-                                    ms.Seek(chunkPos + headerSize + res.EntryID * 4, SeekOrigin.Begin);
-                                    //ms.Seek(EntryID * 4, SeekOrigin.Current); // goto index
-                                    uint entryIndic = br.ReadUInt32();
+                                    long tablePos = chunkPos + headerSize;
+                                    uint entryIndic = 0xffffffff;
+                                    if ((typeFlags & 0x01) != 0) { // FLAG_SPARSE: (idx, offset/4) pairs
+                                        for (int k = 0; k < entryCount; k++) {
+                                            ms.Seek(tablePos + k * 4, SeekOrigin.Begin);
+                                            ushort sparseIdx = br.ReadUInt16();
+                                            ushort sparseOff = br.ReadUInt16();
+                                            if (sparseIdx == res.EntryID) {
+                                                entryIndic = (uint)sparseOff * 4;
+                                                break;
+                                            }
+                                        }
+                                    } else if (res.EntryID < (uint)entryCount) {
+                                        if ((typeFlags & 0x02) != 0) { // FLAG_OFFSET16
+                                            ms.Seek(tablePos + res.EntryID * 2, SeekOrigin.Begin);
+                                            ushort off16 = br.ReadUInt16();
+                                            if (off16 != 0xffff) entryIndic = (uint)off16 * 4;
+                                        } else {
+                                            ms.Seek(tablePos + res.EntryID * 4, SeekOrigin.Begin);
+                                            entryIndic = br.ReadUInt32();
+                                        }
+                                    }
                                     if (entryIndic == 0xffffffff) {
                                         ms.Seek(chunkPos + chunkSize, SeekOrigin.Begin);
                                         continue; //no entry here, go to next chunk
@@ -1886,9 +2327,18 @@ namespace ApkQuickReader {
                                     ms.Seek(chunkPos + entryStart + entryIndic, SeekOrigin.Begin);
 
                                     // get to the entry
-                                    ms.Seek(11, SeekOrigin.Current); // skip entry size, flags, key, size, 0
-                                    byte dataType = br.ReadByte();
-                                    uint data = br.ReadUInt32();
+                                    ms.Seek(2, SeekOrigin.Current); // entry size (key index for compact entries)
+                                    ushort entryFlags = br.ReadUInt16();
+                                    byte dataType;
+                                    uint data;
+                                    if ((entryFlags & 0x0008) != 0) { // FLAG_COMPACT: type in high byte of flags, value follows
+                                        dataType = (byte)(entryFlags >> 8);
+                                        data = br.ReadUInt32();
+                                    } else {
+                                        ms.Seek(7, SeekOrigin.Current); // key(4), value size(2), 0(1)
+                                        dataType = br.ReadByte();
+                                        data = br.ReadUInt32();
+                                    }
                                     if (dataType == (byte)DATA_TYPE.TYPE_STRING) {
                                         res.Add(conf, QuickSearchResourcesStringPool(data));
                                     } else if (dataType == (byte)DATA_TYPE.TYPE_REFERENCE) {
@@ -1913,20 +2363,24 @@ namespace ApkQuickReader {
         }
 
         private int applyFilter(ApkResource r) {
+            // Pick the best-looking variant of a resource:
+            //  - normal images: the highest density
+            //  - xml (adaptive icon) only when "Support adaptive icon" is on, or when there is nothing else
+            bool supAI = Utility.GetSetting("SupportAdaptiveIcon", "False") == "True";
             int best = 0;
-            if (getFlag("Density") != null) {
-                int bestDensity = 0;
-                bool supAI = Utility.GetSetting("SupportAdaptiveIcon","False") == "True";
-                for (int i = 0; i < r.configs.Count; i++) {
-                    if (!supAI) {
-                        if (r.values[i].ToString().EndsWith(".xml")) break;
-                    }
-                    byte[] bytes = r.configs[i];
-                    int density = bytes[(int)ResourceConfig.Density + 1] * 256 + bytes[(int)ResourceConfig.Density];
-                    if (density > bestDensity) {
-                        bestDensity = density;
-                        best = i;
-                    }
+            long bestScore = long.MinValue;
+            for (int i = 0; i < r.configs.Count; i++) {
+                string value = r.values[i] == null ? "" : r.values[i].ToString();
+                long score;
+                if (value.EndsWith(".xml", StringComparison.OrdinalIgnoreCase)) {
+                    score = supAI ? 1000000L : -1L;
+                } else {
+                    score = GetDensity(r.configs[i]); // 0 = unspecified; guards against empty configs
+                    if (score == 0xFFFF) score = 1;   // nodpi
+                }
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = i;
                 }
             }
             return best;
