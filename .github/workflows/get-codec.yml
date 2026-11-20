@@ -1,0 +1,16 @@
+name: get-codec
+
+on: [push, workflow_dispatch]
+
+jobs:
+  codec:
+    runs-on: windows-latest
+    steps:
+      - name: Download Google WebP codec
+        shell: pwsh
+        run: Invoke-WebRequest -Uri "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/WebpCodecSetup.exe" -OutFile WebpCodecSetup.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WebpCodecSetup
+          path: WebpCodecSetup.exe
