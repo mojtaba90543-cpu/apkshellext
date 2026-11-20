@@ -1,0 +1,32 @@
+name: build
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - uses: NuGet/setup-nuget@v2
+
+      - name: Get Google.Protobuf
+        shell: cmd
+        run: nuget install Google.Protobuf -Version 3.8.0 -OutputDirectory packages
+
+      - name: Build
+        shell: cmd
+        run: msbuild ApkShellext2\ApkShellext2.csproj /p:Configuration=Release /p:TargetFrameworkVersion=v4.8 /p:SignAssembly=false /p:PostBuildEvent=
+
+      - name: Add install scripts
+        shell: cmd
+        run: copy /Y ApkShellext2\Resources\*.bat ApkShellext2\bin\Release\
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ApkShellext2-build
+          path: ApkShellext2/bin/Release/
